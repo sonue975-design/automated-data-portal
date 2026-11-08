@@ -1,22 +1,53 @@
-from io import BytesIO
 from datetime import date, datetime
+from io import BytesIO
+import re
 
 import gspread
 import pandas as pd
 import streamlit as st
 
 MAX_FILE_SIZE_MB = 10
+SHEET_COLUMNS = [
+    "Name",
+    "First Name",
+    "Last Name",
+    "Company Name",
+    "Website",
+    "Email",
+    "Verify Status",
+    "LinkedIn",
+]
+
+# Map common source-header variations to the requested Google Sheets columns.
+HEADER_ALIASES = {
+    "name": "Name",
+    "full name": "Name",
+    "first name": "First Name",
+    "firstname": "First Name",
+    "last name": "Last Name",
+    "lastname": "Last Name",
+    "company": "Company Name",
+    "company name": "Company Name",
+    "website": "Website",
+    "url": "Website",
+    "email": "Email",
+    "verify status": "Verify Status",
+    "verification status": "Verify Status",
+    "varify status": "Verify Status",
+    "linkedin": "LinkedIn",
+    "linkedin url": "LinkedIn",
+    "linkedin profile": "LinkedIn",
+}
 
 st.set_page_config(
     page_title="Automated Data Entry & Cleaning Portal",
     page_icon="🤖",
     layout="wide",
 )
-
 st.title("🤖 Automated Data Cleaning & Entry Portal")
 st.markdown(
-    "Upload an Excel or CSV file to clean, format, analyze, and optionally "
-    "sync its rows to a configured Google Sheet."
+    "Upload a contact/lead CSV or Excel file to clean it and optionally sync "
+    "the matching fields to your Google Sheets contact template."
 )
 st.markdown("---")
 st.info(
@@ -28,27 +59,47 @@ st.info(
 
 
 def get_sheet_configuration():
-    """Return configured Google Sheets client and worksheet, if available."""
+    """Return the configured worksheet or a safe, user-facing error."""
     try:
         credentials = dict(st.secrets["gcp_service_account"])
         spreadsheet_id = st.secrets["spreadsheet_id"]
         worksheet_name = st.secrets.get("worksheet_name", "Sheet1")
     except (KeyError, AttributeError):
-        return None, None, "Google Sheets is not configured in app secrets."
+        return None, "Google Sheets is not configured in app secrets."
 
     try:
         client = gspread.service_account_from_dict(credentials)
         worksheet = client.open_by_key(spreadsheet_id).worksheet(worksheet_name)
-        return client, worksheet, None
+        return worksheet, None
     except Exception:
-        return None, None, (
+        return None, (
             "Could not connect to the configured Google Sheet. Check the app "
-            "secrets, sheet ID, worksheet name, and service-account access."
+            "secrets, spreadsheet ID, worksheet name, and service-account access."
         )
 
 
+def normalized_header(value):
+    return re.sub(r"\s+", " ", str(value).strip().lower())
+
+
+def make_contact_sheet_frame(dataframe):
+    """Map recognized contact columns into the fixed screenshot schema."""
+    mapped = {}
+    for source_column in dataframe.columns:
+        destination = HEADER_ALIASES.get(normalized_header(source_column))
+        if destination and destination not in mapped:
+            mapped[destination] = source_column
+
+    result = pd.DataFrame(index=dataframe.index)
+    for column in SHEET_COLUMNS:
+        if column in mapped:
+            result[column] = dataframe[mapped[column]]
+        else:
+            result[column] = ""
+    return result
+
+
 def to_sheet_value(value):
-    """Convert pandas and Python values to safe Google Sheets cell values."""
     if pd.isna(value):
         return ""
     if isinstance(value, (pd.Timestamp, datetime, date)):
@@ -64,7 +115,7 @@ uploaded_file = st.sidebar.file_uploader(
 )
 
 if uploaded_file is None:
-    st.info("👈 Upload an Excel or CSV file from the sidebar to get started.")
+    st.info("👈 Upload a contact/lead Excel or CSV file from the sidebar.")
 else:
     file_size_mb = uploaded_file.size / (1024 * 1024)
     if file_size_mb > MAX_FILE_SIZE_MB:
@@ -81,7 +132,7 @@ else:
             else:
                 df = pd.read_excel(file_bytes)
 
-            st.subheader("📊 Raw Uploaded Data Preview")
+            st.subheader("📊 Uploaded Data Preview")
             st.dataframe(df.head(10), use_container_width=True)
 
             st.sidebar.markdown("---")
@@ -103,66 +154,83 @@ else:
 
             if "processed_df" in st.session_state:
                 st.success("Data successfully processed and cleaned!")
-                st.subheader("✨ Cleaned Output Table")
+                st.subheader("✨ Cleaned Data")
                 edited_df = st.data_editor(
                     st.session_state.processed_df,
                     num_rows="dynamic",
                     use_container_width=True,
                     key="cleaned_data_editor",
                 )
-
-                csv_data = edited_df.to_csv(index=False).encode("utf-8")
                 st.download_button(
                     label="📥 Download Cleaned CSV File",
-                    data=csv_data,
+                    data=edited_df.to_csv(index=False).encode("utf-8"),
                     file_name="client_cleaned_output.csv",
                     mime="text/csv",
                 )
 
+                contact_df = make_contact_sheet_frame(edited_df)
+                mapped_columns = [
+                    column for column in edited_df.columns
+                    if normalized_header(column) in HEADER_ALIASES
+                ]
                 st.markdown("---")
-                st.subheader("📄 Optional Google Sheets Sync")
+                st.subheader("Google Sheets Contact Form Preview")
                 st.caption(
-                    "Sync appends the edited rows to the configured worksheet. "
-                    "The sheet's first row must be empty or match the uploaded "
-                    "column names exactly."
+                    "The sheet template uses the requested columns. Unmatched "
+                    "fields will be left blank; order data is not automatically "
+                    "converted into contact/lead information."
                 )
-                if st.button("Sync cleaned rows to Google Sheets"):
-                    _, worksheet, config_error = get_sheet_configuration()
-                    if config_error:
-                        st.error(config_error)
-                    elif edited_df.empty:
+                st.dataframe(contact_df.head(10), use_container_width=True)
+
+                if st.button("Sync contact rows to Google Sheets"):
+                    if not mapped_columns:
+                        st.error(
+                            "No contact columns were found. Include headers such "
+                            "as Name, First Name, Last Name, Company Name, "
+                            "Website, Email, Verify Status, or LinkedIn."
+                        )
+                    elif contact_df.empty:
                         st.warning("There are no rows to sync.")
                     else:
-                        headers = [str(column) for column in edited_df.columns]
-                        try:
-                            existing = worksheet.row_values(1)
-                            if not existing:
-                                worksheet.update("A1", [headers], value_input_option="RAW")
-                            elif existing != headers:
-                                st.error(
-                                    "The Google Sheet's first row does not match "
-                                    "the uploaded columns. No rows were synced "
-                                    "to avoid placing data in the wrong columns."
-                                )
-                                st.stop()
+                        worksheet, config_error = get_sheet_configuration()
+                        if config_error:
+                            st.error(config_error)
+                        else:
+                            try:
+                                existing_headers = worksheet.row_values(1)
+                                if not existing_headers:
+                                    worksheet.update(
+                                        "A1",
+                                        [SHEET_COLUMNS],
+                                        value_input_option="RAW",
+                                    )
+                                elif existing_headers != SHEET_COLUMNS:
+                                    st.error(
+                                        "The worksheet's first row must exactly "
+                                        "match the template: "
+                                        + ", ".join(SHEET_COLUMNS)
+                                        + ". No rows were synced."
+                                    )
+                                    st.stop()
 
-                            rows = [
-                                [to_sheet_value(value) for value in row]
-                                for row in edited_df.itertuples(
-                                    index=False, name=None
+                                rows = [
+                                    [to_sheet_value(value) for value in row]
+                                    for row in contact_df.itertuples(
+                                        index=False, name=None
+                                    )
+                                ]
+                                worksheet.append_rows(
+                                    rows, value_input_option="RAW"
                                 )
-                            ]
-                            worksheet.append_rows(
-                                rows, value_input_option="RAW"
-                            )
-                            st.success(
-                                f"Synced {len(rows)} rows to Google Sheets."
-                            )
-                        except Exception:
-                            st.error(
-                                "Google Sheets sync failed. Check worksheet "
-                                "permissions and try again."
-                            )
+                                st.success(
+                                    f"Synced {len(rows)} contact rows to "
+                                    "Google Sheets."
+                                )
+                            except Exception:
+                                st.error(
+                                    "Google Sheets sync failed. Check worksheet "
+                                    "permissions and try again."
+                                )
 
                 numeric_cols = edited_df.select_dtypes(
                     include="number"
@@ -185,23 +253,19 @@ with st.expander("Google Sheets setup (admin)"):
     st.markdown(
         "Create a Google service account, enable the Google Sheets API, and "
         "share the target spreadsheet with the service-account email as an "
-        "editor. Add the credentials and target sheet details to Streamlit "
-        "Cloud **App settings → Secrets**. Never commit credentials to GitHub."
+        "editor. Add the values below to Streamlit Cloud **App settings → "
+        "Secrets**. Keep the spreadsheet ID at the top level and credentials "
+        "inside `[gcp_service_account]`. Never commit credentials to GitHub."
     )
     st.code(
+        'spreadsheet_id = "your-google-spreadsheet-id"\n'
+        'worksheet_name = "Sheet1"\n\n'
         '[gcp_service_account]\n'
         'type = "service_account"\n'
         'project_id = "your-project-id"\n'
         'private_key_id = "your-private-key-id"\n'
         'private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"\n'
         'client_email = "your-service-account@your-project.iam.gserviceaccount.com"\n'
-        'token_uri = "https://oauth2.googleapis.com/token"\n\n'
-        'spreadsheet_id = "your-google-spreadsheet-id"\n'
-        'worksheet_name = "Sheet1"',
+        'token_uri = "https://oauth2.googleapis.com/token"',
         language="toml",
-    )
-    st.caption(
-        "The sync keeps the uploaded file's column names and order. To use "
-        "specific contact columns such as Name, Email, or LinkedIn, the source "
-        "file must contain those fields or be mapped before syncing."
     )
